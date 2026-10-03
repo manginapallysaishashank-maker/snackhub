@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react'
 import { onAuthStateChanged, sendPasswordResetEmail, signInWithEmailAndPassword, signOut } from 'firebase/auth'
-import { addDoc, collection, deleteDoc, doc, onSnapshot, setDoc, updateDoc, writeBatch } from 'firebase/firestore'
+import { addDoc, collection, deleteDoc, doc, increment, onSnapshot, runTransaction, setDoc, updateDoc, writeBatch } from 'firebase/firestore'
 import {
   ArrowLeft,
   Check,
@@ -144,7 +144,7 @@ export function AdminDashboard() {
   }, [])
 
   const filteredItems = useMemo(() => dashboard.items.filter((item) => item.name.toLowerCase().includes(itemSearch.trim().toLowerCase())), [dashboard.items, itemSearch])
-  const filteredOrders = useMemo(() => dashboard.orders.filter((order) => `${order.room} ${order.name} ${order.id}`.toLowerCase().includes(orderSearch.trim().toLowerCase())), [dashboard.orders, orderSearch])
+  const filteredOrders = useMemo(() => dashboard.orders.filter((order) => `${order.room} ${order.name} ${order.phone ?? ''} ${order.id}`.toLowerCase().includes(orderSearch.trim().toLowerCase())), [dashboard.orders, orderSearch])
   const pendingCount = dashboard.orders.filter((order) => order.status === 'pending').length
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
@@ -216,8 +216,51 @@ export function AdminDashboard() {
 
   function updateOrderStatus(order: StoreOrder, status: OrderStatus) {
     void runAction(order.id, async () => {
-      await updateDoc(doc(db, 'orders', order.id), { status })
-    })
+      // Runs atomically: status change and stock adjustment succeed or fail together.
+      await runTransaction(db, async (tx) => {
+        const orderRef = doc(db, 'orders', order.id)
+        const snap = await tx.get(orderRef)
+        if (!snap.exists()) throw new Error('This order no longer exists.')
+        const data = snap.data() as StoreOrder
+        const wasCancelled = data.status === 'cancelled'
+        const alreadyRestocked = data.restocked === true
+
+        // Resolve each line to a menu item (older orders have no id, so match by name).
+        const lines = (data.items ?? []).map((line) => ({
+          qty: line.qty,
+          itemId: line.id ?? dashboard.items.find((item) => item.name === line.name)?.id,
+        }))
+
+        // Firestore transactions need all reads before any writes.
+        const liveStock = new Map<string, number | null>()
+        for (const line of lines) {
+          if (!line.itemId || liveStock.has(line.itemId)) continue
+          const itemSnap = await tx.get(doc(db, 'items', line.itemId))
+          liveStock.set(line.itemId, itemSnap.exists() ? Number(itemSnap.data().stock ?? 0) : null)
+        }
+
+        if (status === 'cancelled' && !wasCancelled && !alreadyRestocked) {
+          // Cancelling: put the stock back (once only).
+          lines.forEach((line) => {
+            if (line.itemId && liveStock.get(line.itemId) !== null) tx.update(doc(db, 'items', line.itemId), { stock: increment(line.qty) })
+          })
+          tx.update(orderRef, { status, restocked: true })
+        } else if (status !== 'cancelled' && wasCancelled && alreadyRestocked) {
+          // Un-cancelling: take the stock out again, if there is enough.
+          for (const line of lines) {
+            if (line.itemId && liveStock.get(line.itemId) !== null && (liveStock.get(line.itemId) ?? 0) < line.qty) {
+              throw new Error('Not enough stock to reopen this order.')
+            }
+          }
+          lines.forEach((line) => {
+            if (line.itemId && liveStock.get(line.itemId) !== null) tx.update(doc(db, 'items', line.itemId), { stock: increment(-line.qty) })
+          })
+          tx.update(orderRef, { status, restocked: false })
+        } else {
+          tx.update(orderRef, { status })
+        }
+      })
+    }, status === 'cancelled' ? 'Order cancelled and stock restored.' : undefined)
   }
 
   async function createItem(event: FormEvent<HTMLFormElement>) {
@@ -398,7 +441,7 @@ function OrdersPanel({
   onSearch?: (value: string) => void
 }) {
   return <section className="overflow-hidden rounded-[26px] border border-[#ECE4DD] bg-white"><div className="flex flex-col gap-3 border-b border-[#F1EBE5] p-5 sm:flex-row sm:items-center sm:justify-between sm:px-6"><div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-[14px] bg-[#FFF5DE] text-[#A96E14]"><ShoppingBag size={18} /></span><div><h2 className="font-display text-lg font-bold">{title} <span className="ml-1 text-sm font-medium text-[#968D87]">{orders.length}</span></h2><p className="text-xs text-[#817A76]">Latest order activity and fulfillment status.</p></div></div>{onSearch && <label className="flex h-10 w-full items-center gap-2 rounded-xl border border-[#EAE1DA] px-3 text-[#968D87] sm:max-w-[245px]"><Search size={15} /><span className="sr-only">Search orders</span><input value={search} onChange={(event) => onSearch(event.target.value)} className="min-w-0 flex-1 bg-transparent text-xs text-[#292422] outline-none" placeholder="Room, name, or order ID" /></label>}</div>
-    {orders.length === 0 ? <EmptyPanel title="No orders to show" text="New customer orders will appear here." /> : <div className="divide-y divide-[#F3EDE8]">{orders.map((order) => <article key={order.id} className="p-5 transition hover:bg-[#FFFCF9] sm:px-6"><div className="flex flex-wrap items-start justify-between gap-3"><div className="flex min-w-0 items-center gap-2"><span className="rounded-full bg-[#292422] px-3 py-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-white">Room {order.room}</span><span className="truncate text-xs font-semibold text-[#655D59]">{order.name || 'Guest'}</span></div><span className="font-display text-lg font-bold">₹{formatRupees(order.total)}</span></div><div className="mt-3 flex flex-wrap gap-1.5">{order.items.map((item, index) => <span key={`${item.name}-${index}`} className="rounded-lg bg-[#F8F5F2] px-2 py-1 text-[10px] font-semibold text-[#655D59]">{item.qty} × {item.name}</span>)}</div><div className="mt-4 flex flex-wrap items-center justify-between gap-3"><div className="flex flex-wrap items-center gap-3 text-[10px] font-semibold text-[#968D87]"><span>{order.payment === 'online' ? 'Online payment' : 'Cash on delivery'}</span><span className="flex items-center gap-1"><Clock3 size={12} />{formatOrderTime(order.createdAt || order.time)}</span><span className="font-mono">#{order.id.slice(0, 8)}</span></div><label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[.06em] text-[#817A76]">Status<select aria-label={`Status for order ${order.id}`} disabled={busyAction === order.id} value={order.status || 'pending'} onChange={(event) => onStatusChange(order, event.target.value as OrderStatus)} className="h-9 rounded-xl border border-[#EAE1DA] bg-white px-2 text-xs font-bold normal-case tracking-normal text-[#39322F] outline-none focus:border-[#FF8588]">{orderStatuses.map((status) => <option value={status} key={status}>{status.charAt(0).toUpperCase() + status.slice(1)}</option>)}</select></label></div></article>)}</div>}
+    {orders.length === 0 ? <EmptyPanel title="No orders to show" text="New customer orders will appear here." /> : <div className="divide-y divide-[#F3EDE8]">{orders.map((order) => <article key={order.id} className="p-5 transition hover:bg-[#FFFCF9] sm:px-6"><div className="flex flex-wrap items-start justify-between gap-3"><div className="flex min-w-0 items-center gap-2"><span className="rounded-full bg-[#292422] px-3 py-1.5 text-[10px] font-bold uppercase tracking-[.06em] text-white">Room {order.room}</span><span className="truncate text-xs font-semibold text-[#655D59]">{order.name || 'Guest'}</span>{order.phone && <a href={`tel:${order.phone}`} className="text-xs font-semibold text-[#3B82F6]">{order.phone}</a>}</div><span className="font-display text-lg font-bold">₹{formatRupees(order.total)}</span></div><div className="mt-3 flex flex-wrap gap-1.5">{order.items.map((item, index) => <span key={`${item.name}-${index}`} className="rounded-lg bg-[#F8F5F2] px-2 py-1 text-[10px] font-semibold text-[#655D59]">{item.qty} × {item.name}</span>)}</div><div className="mt-4 flex flex-wrap items-center justify-between gap-3"><div className="flex flex-wrap items-center gap-3 text-[10px] font-semibold text-[#968D87]"><span>{order.payment === 'online' ? 'Online payment' : 'Cash on delivery'}</span><span className="flex items-center gap-1"><Clock3 size={12} />{formatOrderTime(order.createdAt || order.time)}</span>{order.etaAt && order.status !== 'delivered' && order.status !== 'cancelled' && <span className="rounded-full bg-[#FFF5DE] px-2 py-0.5 text-[#A96E14]">Promised by {new Intl.DateTimeFormat('en-IN', { hour: 'numeric', minute: '2-digit' }).format(new Date(order.etaAt))}</span>}<span className="font-mono">#{order.id.slice(0, 8)}</span></div><label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[.06em] text-[#817A76]">Status<select aria-label={`Status for order ${order.id}`} disabled={busyAction === order.id} value={order.status || 'pending'} onChange={(event) => onStatusChange(order, event.target.value as OrderStatus)} className="h-9 rounded-xl border border-[#EAE1DA] bg-white px-2 text-xs font-bold normal-case tracking-normal text-[#39322F] outline-none focus:border-[#FF8588]">{orderStatuses.map((status) => <option value={status} key={status}>{status.charAt(0).toUpperCase() + status.slice(1)}</option>)}</select></label></div></article>)}</div>}
   </section>
 }
 

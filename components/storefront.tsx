@@ -18,6 +18,9 @@ import {
 import {
   categories,
   db,
+  estimateDeliveryMinutes,
+  formatClock,
+  formatCountdown,
   formatRupees,
   iconForCategory,
   type Product,
@@ -44,10 +47,24 @@ export function Storefront() {
   const [cartOpen, setCartOpen] = useState(false)
   const [room, setRoom] = useState('')
   const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
   const [payment, setPayment] = useState<'cash' | 'online'>('cash')
   const [submitting, setSubmitting] = useState(false)
   const [orderError, setOrderError] = useState('')
   const [receipt, setReceipt] = useState('')
+  const [eta, setEta] = useState<{ minutes: number; at: number } | null>(null)
+  const [orderStatus, setOrderStatus] = useState('pending')
+  const [now, setNow] = useState(Date.now())
+
+  // Track the placed order live (status changes) and tick the countdown.
+  useEffect(() => {
+    if (!receipt) return
+    const unsub = onSnapshot(doc(db, 'orders', receipt), (snap) => {
+      if (snap.exists()) setOrderStatus(String(snap.data().status ?? 'pending'))
+    }, () => {})
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => { unsub(); clearInterval(timer) }
+  }, [receipt])
 
   // Live Firestore sync - the storefront updates instantly whenever the
   // admin adds an item, changes stock, or opens/closes the store. No
@@ -113,8 +130,12 @@ export function Storefront() {
   async function placeOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setOrderError('')
-    if (!room.trim()) {
-      setOrderError('Add your room number to continue.')
+    if (!/^\d{3}$/.test(room.trim())) {
+      setOrderError('Enter your 3-digit room number to continue.')
+      return
+    }
+    if (!/^[6-9]\d{9}$/.test(phone)) {
+      setOrderError('Enter a valid 10-digit mobile number (starting with 6, 7, 8 or 9).')
       return
     }
     if (!cartLines.length) {
@@ -139,21 +160,31 @@ export function Storefront() {
       })
       await batch.commit()
 
+      const etaMinutes = estimateDeliveryMinutes(cartLines.reduce((sum, line) => sum + line.qty, 0))
+      const createdAt = Date.now()
+      const etaAt = createdAt + etaMinutes * 60_000
+
       const orderRef = await addDoc(collection(db, 'orders'), {
         room: room.trim(),
         name: name.trim() || 'Guest',
-        items: cartLines.map((line) => ({ name: line.product.name, qty: line.qty, price: line.product.price })),
+        phone,
+        items: cartLines.map((line) => ({ id: line.id, name: line.product.name, qty: line.qty, price: line.product.price })),
         total,
         payment,
         time: new Date().toLocaleString(),
-        createdAt: Date.now(),
+        createdAt,
+        etaMinutes,
+        etaAt,
         status: 'pending',
       })
 
+      setEta({ minutes: etaMinutes, at: etaAt })
+      setOrderStatus('pending')
       setReceipt(orderRef.id)
       setCart([])
       setRoom('')
       setName('')
+      setPhone('')
       setCartOpen(false)
     } catch (caught) {
       setOrderError(caught instanceof Error ? caught.message : 'Could not place your order. Please try again.')
@@ -237,7 +268,8 @@ export function Storefront() {
           </div>
           <form onSubmit={placeOrder} className="border-t border-[#F0E9E3] bg-white px-5 pb-6 pt-5 sm:px-7 sm:pb-7">
             {orderError && <p role="alert" className="mb-3 rounded-xl bg-[#FFF0EF] px-3 py-2 text-sm font-medium text-[#AC3E42]">{orderError}</p>}
-            <label className="mb-3 block"><span className="mb-1.5 block text-xs font-bold text-[#514944]">Room number <span className="text-[#D84B50]">*</span></span><input required maxLength={30} value={room} onChange={(event) => setRoom(event.target.value)} placeholder="e.g. A-204" className="h-12 w-full rounded-xl border border-[#EAE1DA] bg-[#FFFCF9] px-3.5 text-sm outline-none transition focus:border-[#FF8588] focus:ring-3 focus:ring-[#FF5A5F]/10" /></label>
+            <label className="mb-3 block"><span className="mb-1.5 block text-xs font-bold text-[#514944]">Room number <span className="text-[#D84B50]">*</span></span><input required inputMode="numeric" pattern="[0-9]{3}" maxLength={3} value={room} onChange={(event) => setRoom(event.target.value.replace(/\D/g, '').slice(0, 3))} placeholder="e.g. 204" className="h-12 w-full rounded-xl border border-[#EAE1DA] bg-[#FFFCF9] px-3.5 text-sm outline-none transition focus:border-[#FF8588] focus:ring-3 focus:ring-[#FF5A5F]/10" /></label>
+            <label className="mb-3 block"><span className="mb-1.5 block text-xs font-bold text-[#514944]">Mobile number <span className="text-[#D84B50]">*</span></span><input required type="tel" inputMode="numeric" autoComplete="tel-national" pattern="[6-9][0-9]{9}" minLength={10} maxLength={10} title="Enter a valid 10-digit mobile number" value={phone} onChange={(event) => setPhone(event.target.value.replace(/\D/g, '').slice(0, 10))} placeholder="10-digit mobile number" className="h-12 w-full rounded-xl border border-[#EAE1DA] bg-[#FFFCF9] px-3.5 text-sm outline-none transition focus:border-[#FF8588] focus:ring-3 focus:ring-[#FF5A5F]/10" /></label>
             <label className="mb-4 block"><span className="mb-1.5 block text-xs font-bold text-[#514944]">Your name <span className="font-normal text-[#968D87]">(optional)</span></span><input maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="What should we call you?" className="h-12 w-full rounded-xl border border-[#EAE1DA] bg-[#FFFCF9] px-3.5 text-sm outline-none transition focus:border-[#FF8588] focus:ring-3 focus:ring-[#FF5A5F]/10" /></label>
             <div className="mb-4 grid grid-cols-2 gap-2"><button type="button" onClick={() => setPayment('cash')} aria-pressed={payment === 'cash'} className={`flex h-11 items-center justify-center gap-2 rounded-xl border text-sm font-bold transition ${payment === 'cash' ? 'border-[#FF5A5F] bg-[#FFF0EF] text-[#D94A4F]' : 'border-[#EAE1DA] bg-white text-[#6F6660]'}`}><span aria-hidden="true">₹</span> Cash</button><button type="button" onClick={() => setPayment('online')} aria-pressed={payment === 'online'} className={`flex h-11 items-center justify-center gap-2 rounded-xl border text-sm font-bold transition ${payment === 'online' ? 'border-[#FF5A5F] bg-[#FFF0EF] text-[#D94A4F]' : 'border-[#EAE1DA] bg-white text-[#6F6660]'}`}><Check size={16} /> Online</button></div>
             <div className="mb-4 flex items-center justify-between border-t border-dashed border-[#E7DDD5] pt-4"><span className="text-sm font-semibold text-[#655D59]">Order total</span><span className="font-display text-2xl font-bold">₹{formatRupees(total)}</span></div>
@@ -249,7 +281,8 @@ export function Storefront() {
 
       {receipt && <div className="fixed inset-0 z-[60] flex items-center justify-center bg-[#211B18]/50 p-5 backdrop-blur-sm" role="presentation">
         <section role="dialog" aria-modal="true" aria-labelledby="order-success" className="w-full max-w-sm rounded-[30px] bg-white px-7 py-9 text-center shadow-2xl">
-          <span className="mx-auto flex size-16 items-center justify-center rounded-[22px] bg-[#EAF7EF] text-[#288251]"><Check size={27} strokeWidth={2.6} /></span><p className="mt-5 text-[10px] font-bold uppercase tracking-[.16em] text-[#31935D]">Order received</p><h2 id="order-success" className="font-display mt-1 text-3xl font-bold">You&apos;re all set!</h2><p className="mt-2 text-sm leading-6 text-[#817A76]">Your snacks are headed to room delivery. Keep this order reference handy.</p><p className="mt-4 rounded-xl bg-[#F7F2ED] px-3 py-2 font-mono text-xs text-[#6F6660]">{receipt}</p><button type="button" onClick={() => setReceipt('')} className="mt-6 w-full rounded-full bg-[#252120] py-3.5 text-sm font-bold text-white transition hover:bg-[#39322F]">Back to the menu</button>
+          <span className="mx-auto flex size-16 items-center justify-center rounded-[22px] bg-[#EAF7EF] text-[#288251]"><Check size={27} strokeWidth={2.6} /></span><p className="mt-5 text-[10px] font-bold uppercase tracking-[.16em] text-[#31935D]">Order received</p><h2 id="order-success" className="font-display mt-1 text-3xl font-bold">You&apos;re all set!</h2><p className="mt-2 text-sm leading-6 text-[#817A76]">Your snacks are headed to your room. Keep this order reference handy.</p>
+          {eta && (orderStatus === 'delivered' ? <p className="mt-4 rounded-xl bg-[#EAF7EF] px-3 py-3 text-sm font-bold text-[#26754A]">Delivered. Enjoy your snacks!</p> : orderStatus === 'cancelled' ? <p className="mt-4 rounded-xl bg-[#FFF0EF] px-3 py-3 text-sm font-bold text-[#AE4246]">This order was cancelled by the store.</p> : <div className="mt-4 rounded-xl bg-[#FFF5DE] px-3 py-3"><p className="text-[10px] font-bold uppercase tracking-[.14em] text-[#A96E14]">Estimated delivery</p><p className="font-display mt-1 text-2xl font-bold text-[#292422]">{eta.at - now > 0 ? formatCountdown(eta.at - now) : 'Arriving any moment'}</p><p className="mt-1 text-xs text-[#817A76]">About {eta.minutes} min &middot; by {formatClock(eta.at)}</p></div>)}<p className="mt-4 rounded-xl bg-[#F7F2ED] px-3 py-2 font-mono text-xs text-[#6F6660]">{receipt}</p><button type="button" onClick={() => setReceipt('')} className="mt-6 w-full rounded-full bg-[#252120] py-3.5 text-sm font-bold text-white transition hover:bg-[#39322F]">Back to the menu</button>
         </section>
       </div>}
 
