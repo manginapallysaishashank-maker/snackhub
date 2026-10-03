@@ -38,12 +38,16 @@ export type StoreOrder = {
   id: string
   room: string
   name: string
-  items: { name: string; qty: number; price: number }[]
+  phone?: string
+  items: { id?: string; name: string; qty: number; price: number }[]
   total: number
   payment: 'cash' | 'online'
   time: string
   createdAt: number
   status: 'pending' | 'preparing' | 'delivered' | 'cancelled'
+  etaMinutes?: number
+  etaAt?: number
+  restocked?: boolean
 }
 export type StoreSettings = { open: boolean }
 export const categories: { id: SnackCategory; title: string; eyebrow: string }[] = [
@@ -398,7 +402,7 @@ export function isNotEmpty(value: string) {
 }
 
 export function validOrderRoom(value: string) {
-  return value.trim().length > 0 && value.trim().length <= 30
+  return /^\d{3}$/.test(value.trim())
 }
 
 export function getStoreHoursLabel() {
@@ -727,4 +731,31 @@ export function getPageTitle() {
 
 export function getPageDescription() {
   return 'Quick bites delivered to your hostel room.'
+}
+
+
+// ---- Delivery time estimate -------------------------------------------
+// Base prep/delivery time plus a little extra for bigger orders.
+export const BASE_DELIVERY_MINUTES = 15
+export const EXTRA_MINUTES_PER_ITEMS = 2 // +2 min for every 3 items after the first 3
+export const MAX_DELIVERY_MINUTES = 45
+
+export function estimateDeliveryMinutes(totalItems: number) {
+  const extra = Math.max(0, Math.ceil((totalItems - 3) / 3)) * EXTRA_MINUTES_PER_ITEMS
+  return Math.min(MAX_DELIVERY_MINUTES, BASE_DELIVERY_MINUTES + extra)
+}
+
+export function formatCountdown(msLeft: number) {
+  const total = Math.max(0, Math.ceil(msLeft / 1000))
+  const m = Math.floor(total / 60)
+  const sec = total % 60
+  return `${m}:${String(sec).padStart(2, '0')}`
+}
+
+export function formatClock(value: number) {
+  return new Intl.DateTimeFormat('en-IN', { hour: 'numeric', minute: '2-digit' }).format(new Date(value))
+}
+
+export function isValidPhone(value: string) {
+  return /^[6-9]\d{9}$/.test(value)
 }
